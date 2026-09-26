@@ -589,3 +589,127 @@ class CableCuttingResultResponse(BaseModel):
         ..., description="各启用盘的裁切清单与剩余长度（按电缆盘编号排序）；无解时为空"
     )
     message: str
+
+
+class CableRouteEdgeIn(BaseModel):
+    """一条无向边（端点编号无方向，按 (u, v) 规范化处理）。"""
+
+    u: int = Field(..., ge=0, description="边的一个端点节点编号（0 ~ 节点数-1）")
+    v: int = Field(..., ge=0, description="边的另一个端点节点编号（0 ~ 节点数-1）")
+    length: int = Field(..., gt=0, description="边长度（正整数）")
+    capacity: int = Field(
+        ..., ge=0, le=4, description="该边可同时容纳的电缆数（0 ~ 4）"
+    )
+
+
+class CableRoutePhaseStarts(BaseModel):
+    """各相电缆起点节点编号。"""
+
+    A: int = Field(..., ge=0, description="A 相起点节点编号")
+    B: int = Field(..., ge=0, description="B 相起点节点编号")
+    C: int = Field(..., ge=0, description="C 相起点节点编号")
+
+
+class CableRouteDeviceEndIn(BaseModel):
+    """单台设备的终点节点。"""
+
+    device_id: str = Field(
+        ..., min_length=1, max_length=64, description="设备编号，须完整覆盖计算记录中的设备"
+    )
+    endpoint: int = Field(..., ge=0, description="该设备的终点节点编号（0 ~ 节点数-1）")
+
+
+class CableRoutesRequest(BaseModel):
+    """电缆路由预演请求体（仅预演，不修改历史计算记录）。"""
+
+    node_count: int = Field(
+        ..., ge=1, le=6, description="节点数（节点编号 0 ~ node_count-1），1 ~ 6"
+    )
+    edges: list[CableRouteEdgeIn] = Field(
+        ..., max_length=8, description="无向边，至多 8 条；无自环、无重复，长度正整数，容量 0~4"
+    )
+    phase_starts: CableRoutePhaseStarts = Field(
+        ..., description="各相电缆起点节点编号（A/B/C 均须给出）"
+    )
+    device_endpoints: list[CableRouteDeviceEndIn] = Field(
+        ...,
+        min_length=1,
+        max_length=4,
+        description="每台设备的终点节点，1 ~ 4 台；设备编号不重复且须完整覆盖计算记录",
+    )
+
+    @model_validator(mode="after")
+    def _validate_graph(self) -> "CableRoutesRequest":
+        max_node = self.node_count - 1
+        # 各相起点与所有边端点、设备终点都必须是合法节点引用
+        starts = (self.phase_starts.A, self.phase_starts.B, self.phase_starts.C)
+        for idx, node in enumerate(starts):
+            if node > max_node:
+                phase = "ABC"[idx]
+                raise ValueError(f"{phase} 相起点节点编号超出范围：{node} > {max_node}")
+        seen_edges: set[tuple[int, int]] = set()
+        for edge in self.edges:
+            if edge.u == edge.v:
+                raise ValueError(f"边不允许自环：({edge.u}, {edge.v})")
+            if edge.u > max_node or edge.v > max_node:
+                raise ValueError(
+                    f"边端点节点编号超出范围：({edge.u}, {edge.v})，最大合法编号为 {max_node}"
+                )
+            key = (min(edge.u, edge.v), max(edge.u, edge.v))
+            if key in seen_edges:
+                raise ValueError(f"无向边不允许重复：({key[0]}, {key[1]})")
+            seen_edges.add(key)
+        endpoint_ids = [item.device_id for item in self.device_endpoints]
+        if len(endpoint_ids) != len(set(endpoint_ids)):
+            raise ValueError("设备编号必须唯一")
+        for item in self.device_endpoints:
+            if item.endpoint > max_node:
+                raise ValueError(
+                    f"设备 {item.device_id} 的终点节点编号超出范围："
+                    f"{item.endpoint} > {max_node}"
+                )
+        return self
+
+
+class CableRoutePathItem(BaseModel):
+    """一台设备的电缆路径。"""
+
+    device_id: str = Field(..., description="设备编号")
+    phase: Phase = Field(..., description="所属相（决定路径起点）")
+    endpoint: int = Field(..., description="设备终点节点编号")
+    nodes: list[int] = Field(
+        ...,
+        description="路径经过的节点序列（无重复节点）；起终点相同时为单节点零边路径",
+    )
+    length: int = Field(..., ge=0, description="路径总长度（零边路径为 0）")
+
+
+class CableRouteEdgeUsageItem(BaseModel):
+    """一条边上的电缆占用情况。"""
+
+    u: int = Field(..., description="边的较小端节点编号")
+    v: int = Field(..., description="边的较大端节点编号")
+    length: int = Field(..., description="边长度（正整数）")
+    capacity: int = Field(..., description="边可容纳的电缆数（0 ~ 4）")
+    occupied: int = Field(
+        ..., ge=0, description="经该边铺设的电缆数（不超过容量；未使用的边为 0）"
+    )
+
+
+class CableRoutesResultResponse(BaseModel):
+    """电缆路由预演结果（原计算记录不做任何修改）。"""
+
+    id: int
+    created_at: str
+    node_count: int = Field(..., ge=1, le=6, description="节点数（回显请求输入）")
+    feasible: bool = Field(..., description="是否存在满足各边容量的电缆路由方案")
+    total_length: Optional[int] = Field(
+        None, description="各路径长度之和（最优总长度）；无解时为 null"
+    )
+    paths: list[CableRoutePathItem] = Field(
+        ..., description="各设备路径（按设备编号排序）；无解时为空"
+    )
+    edge_usage: list[CableRouteEdgeUsageItem] = Field(
+        ..., description="各边占用情况（按端点编号排序）；无解时仍列出全部边（占用均为 0）"
+    )
+    message: str

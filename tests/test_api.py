@@ -1799,3 +1799,296 @@ def test_cable_cutting_does_not_modify_record():
         ),
     ).json()
     assert again == resp.json()
+
+
+# ---------------------------------------------------------------------------
+# 电缆路由预演
+# ---------------------------------------------------------------------------
+
+CABLE_ROUTE_PAYLOAD = {
+    "capacities": {"A": 100, "B": 100, "C": 100},
+    "devices": [
+        {"id": "D1", "power": 10, "allowed_phases": ["A"]},
+        {"id": "D2", "power": 20, "allowed_phases": ["B"]},
+        {"id": "D3", "power": 30, "allowed_phases": ["C"]},
+    ],
+}
+
+
+def _route_body(endpoints, edges=None, node_count=4, starts=None):
+    return {
+        "node_count": node_count,
+        "edges": edges
+        if edges is not None
+        else [
+            {"u": 0, "v": 1, "length": 1, "capacity": 4},
+            {"u": 1, "v": 2, "length": 2, "capacity": 4},
+            {"u": 2, "v": 3, "length": 3, "capacity": 4},
+        ],
+        "phase_starts": starts
+        if starts is not None
+        else {"A": 0, "B": 1, "C": 2},
+        "device_endpoints": [
+            {"device_id": device_id, "endpoint": endpoint}
+            for device_id, endpoint in endpoints
+        ],
+    }
+
+
+def test_cable_routes_success():
+    created = _create(CABLE_ROUTE_PAYLOAD)
+    calc_id = created["id"]
+
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/cable-routes",
+        json=_route_body([("D1", 1), ("D2", 2), ("D3", 3)]),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == calc_id
+    assert body["node_count"] == 4
+    assert body["feasible"] is True
+    assert body["total_length"] == 6  # D1:0->1(1) + D2:1->2(2) + D3:2->3(3)
+    assert body["paths"] == [
+        {"device_id": "D1", "phase": "A", "endpoint": 1, "nodes": [0, 1], "length": 1},
+        {"device_id": "D2", "phase": "B", "endpoint": 2, "nodes": [1, 2], "length": 2},
+        {"device_id": "D3", "phase": "C", "endpoint": 3, "nodes": [2, 3], "length": 3},
+    ]
+    # 各边按端点编号排序返回，占用 = 经过该边的电缆数
+    assert body["edge_usage"] == [
+        {"u": 0, "v": 1, "length": 1, "capacity": 4, "occupied": 1},
+        {"u": 1, "v": 2, "length": 2, "capacity": 4, "occupied": 1},
+        {"u": 2, "v": 3, "length": 3, "capacity": 4, "occupied": 1},
+    ]
+    assert "预演" in body["message"]
+
+
+def test_cable_routes_zero_edge_path():
+    created = _create(CABLE_ROUTE_PAYLOAD)
+    # 每台设备终点即所属相起点：零边路径，总长度 0
+    body = client.post(
+        f"/api/v1/calculations/{created['id']}/cable-routes",
+        json=_route_body([("D1", 0), ("D2", 1), ("D3", 2)]),
+    ).json()
+    assert body["feasible"] is True
+    assert body["total_length"] == 0
+    assert [p["nodes"] for p in body["paths"]] == [[0], [1], [2]]
+    assert all(u["occupied"] == 0 for u in body["edge_usage"])
+
+
+def test_cable_routes_capacity_detour_and_lex_order():
+    created = _create(CABLE_ROUTE_PAYLOAD)
+    edges = [
+        {"u": 0, "v": 3, "length": 1, "capacity": 1},
+        {"u": 0, "v": 1, "length": 1, "capacity": 4},
+        {"u": 1, "v": 2, "length": 1, "capacity": 4},
+        {"u": 2, "v": 3, "length": 1, "capacity": 4},
+    ]
+    # D1/D2 均归 A 相的记录：单独构造 A/A 两台
+    payload = {
+        "capacities": {"A": 100, "B": 100, "C": 100},
+        "devices": [
+            {"id": "D1", "power": 10, "allowed_phases": ["A"]},
+            {"id": "D2", "power": 20, "allowed_phases": ["A"]},
+        ],
+    }
+    rec = _create(payload)
+    body = client.post(
+        f"/api/v1/calculations/{rec['id']}/cable-routes",
+        json=_route_body(
+            [("D1", 3), ("D2", 3)], edges=edges, starts={"A": 0, "B": 0, "C": 0}
+        ),
+    ).json()
+    assert body["feasible"] is True
+    # 直连容量 1：一台走 (0,3) 长度 1，另一台绕行 (0,1,2,3) 长度 3，总长 4；
+    # 等长搭配中字典序最小者让 D1 走字典序更小的 (0,1,2,3)
+    assert body["total_length"] == 4
+    assert body["paths"][0]["nodes"] == [0, 1, 2, 3]
+    assert body["paths"][1]["nodes"] == [0, 3]
+    for usage in body["edge_usage"]:
+        assert usage["occupied"] <= usage["capacity"]
+
+
+def test_cable_routes_infeasible_capacity():
+    created = _create(CABLE_ROUTE_PAYLOAD)
+    # D1(0->1) 与 D2(1->0) 都必经唯一边 0-1，容量 1：无解
+    edges = [
+        {"u": 0, "v": 1, "length": 1, "capacity": 1},
+        {"u": 1, "v": 2, "length": 1, "capacity": 4},
+        {"u": 2, "v": 3, "length": 1, "capacity": 4},
+    ]
+    body = client.post(
+        f"/api/v1/calculations/{created['id']}/cable-routes",
+        json=_route_body([("D1", 1), ("D2", 0), ("D3", 3)], edges=edges),
+    ).json()
+    assert body["feasible"] is False
+    assert body["total_length"] is None
+    assert body["paths"] == []
+    # 无解时仍列出全部边（规范化并按端点排序），占用均为 0
+    assert body["edge_usage"] == [
+        {"u": 0, "v": 1, "length": 1, "capacity": 1, "occupied": 0},
+        {"u": 1, "v": 2, "length": 1, "capacity": 4, "occupied": 0},
+        {"u": 2, "v": 3, "length": 1, "capacity": 4, "occupied": 0},
+    ]
+    assert "无可布路由" in body["message"]
+
+
+def test_cable_routes_infeasible_unreachable():
+    created = _create(CABLE_ROUTE_PAYLOAD)
+    edges = [
+        {"u": 0, "v": 1, "length": 1, "capacity": 4},
+        # 节点 3 为孤立节点，D3 自 C 相起点 2 无法到达
+    ]
+    body = client.post(
+        f"/api/v1/calculations/{created['id']}/cable-routes",
+        json=_route_body(
+            [("D1", 1), ("D2", 1), ("D3", 3)], edges=edges
+        ),
+    ).json()
+    assert body["feasible"] is False
+
+
+def test_cable_routes_404():
+    resp = client.post(
+        "/api/v1/calculations/999999/cable-routes",
+        json=_route_body([("D1", 0)]),
+    )
+    assert resp.status_code == 404
+
+
+def test_cable_routes_409_when_record_infeasible():
+    created = _create(INFEASIBLE_UPGRADE_PAYLOAD)
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/cable-routes",
+        json=_route_body([("BIG", 0), ("FIX", 0)]),
+    )
+    assert resp.status_code == 409
+
+
+def test_cable_routes_422_when_more_than_four_devices():
+    payload = {
+        "capacities": {"A": 1000, "B": 1000, "C": 1000},
+        "devices": [
+            {"id": f"D{i}", "power": 1, "allowed_phases": ["A", "B", "C"]}
+            for i in range(5)
+        ],
+    }
+    created = _create(payload)
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/cable-routes",
+        json=_route_body(
+            [(f"D{i}", 0) for i in range(4)],
+            edges=[],
+            node_count=1,
+            starts={"A": 0, "B": 0, "C": 0},
+        ),
+    )
+    assert resp.status_code == 422
+    assert "4" in resp.json()["detail"]
+
+
+def test_cable_routes_422_endpoint_mapping_mismatch():
+    created = _create(CABLE_ROUTE_PAYLOAD)
+    url = f"/api/v1/calculations/{created['id']}/cable-routes"
+
+    # 缺少 D3、多出 D9
+    resp = client.post(url, json=_route_body([("D1", 0), ("D2", 0), ("D9", 0)]))
+    assert resp.status_code == 422
+
+    # 设备编号重复
+    body = _route_body([("D1", 0), ("D2", 0), ("D3", 0)])
+    body["device_endpoints"].append({"device_id": "D1", "endpoint": 0})
+    resp = client.post(url, json=body)
+    assert resp.status_code == 422
+
+
+def test_cable_routes_validation():
+    created = _create(CABLE_ROUTE_PAYLOAD)
+    url = f"/api/v1/calculations/{created['id']}/cable-routes"
+    base = _route_body([("D1", 3), ("D2", 3), ("D3", 3)])
+
+    # 自环边
+    body = {**base, "edges": [{"u": 1, "v": 1, "length": 1, "capacity": 1}]}
+    assert client.post(url, json=body).status_code == 422
+
+    # 重复无向边（含反向重复）
+    body = {
+        **base,
+        "edges": [
+            {"u": 0, "v": 1, "length": 1, "capacity": 1},
+            {"u": 1, "v": 0, "length": 2, "capacity": 1},
+        ],
+    }
+    assert client.post(url, json=body).status_code == 422
+
+    # 边长度非正整数
+    body = {**base, "edges": [{"u": 0, "v": 1, "length": 0, "capacity": 1}]}
+    assert client.post(url, json=body).status_code == 422
+
+    # 容量超范围
+    body = {**base, "edges": [{"u": 0, "v": 1, "length": 1, "capacity": 5}]}
+    assert client.post(url, json=body).status_code == 422
+    body = {**base, "edges": [{"u": 0, "v": 1, "length": 1, "capacity": -1}]}
+    assert client.post(url, json=body).status_code == 422
+
+    # 节点引用越界
+    body = {**base, "edges": [{"u": 0, "v": 4, "length": 1, "capacity": 1}]}
+    assert client.post(url, json=body).status_code == 422
+    body = {**base, "phase_starts": {"A": 9, "B": 0, "C": 0}}
+    assert client.post(url, json=body).status_code == 422
+    body = {
+        **base,
+        "device_endpoints": [
+            {"device_id": "D1", "endpoint": 3},
+            {"device_id": "D2", "endpoint": 3},
+            {"device_id": "D3", "endpoint": 9},
+        ],
+    }
+    assert client.post(url, json=body).status_code == 422
+
+
+def test_cable_routes_scale_limits():
+    created = _create(CABLE_ROUTE_PAYLOAD)
+    url = f"/api/v1/calculations/{created['id']}/cable-routes"
+    base = _route_body([("D1", 0), ("D2", 0), ("D3", 0)])
+
+    # 节点数超过 6
+    body = {**base, "node_count": 7}
+    assert client.post(url, json=body).status_code == 422
+
+    # 节点数为 0
+    body = {**base, "node_count": 0}
+    assert client.post(url, json=body).status_code == 422
+
+    # 边数超过 8
+    body = {
+        **base,
+        "node_count": 5,
+        "edges": [
+            {"u": i, "v": 4, "length": 1, "capacity": 1} for i in range(9)
+        ],
+    }
+    assert client.post(url, json=body).status_code == 422
+
+
+def test_cable_routes_does_not_modify_record():
+    created = _create(CABLE_ROUTE_PAYLOAD)
+    calc_id = created["id"]
+    before = client.get(f"/api/v1/calculations/{calc_id}").json()
+    count_before = len(client.get("/api/v1/calculations").json())
+
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/cable-routes",
+        json=_route_body([("D1", 1), ("D2", 2), ("D3", 3)]),
+    )
+    assert resp.status_code == 200
+
+    after = client.get(f"/api/v1/calculations/{calc_id}").json()
+    assert after == before
+    assert len(client.get("/api/v1/calculations").json()) == count_before
+
+    again = client.post(
+        f"/api/v1/calculations/{calc_id}/cable-routes",
+        json=_route_body([("D1", 1), ("D2", 2), ("D3", 3)]),
+    ).json()
+    assert again == resp.json()

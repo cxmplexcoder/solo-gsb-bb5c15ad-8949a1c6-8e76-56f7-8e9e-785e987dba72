@@ -103,6 +103,17 @@ A/B/C 展开，完整方案按相位序列字典序依次产生；目标键为 (
 再在最优 (盘数, 总长度) 预算内按设备编号顺序 DFS，盘按编号顺序展开，
 首个完整方案即编号序列字典序最小者，配合容量、盘数 / 总长度预算剪枝与
 失败状态记忆化。
+
+电缆路由预演（solve_cable_routes）：在 1~6 个节点、至多 8 条无向边
+（正整数长度、容量 0~4）构成的图上，为至多 4 台设备各选一条自所属相起点
+到其终点的无重复节点简单路径（起终点相同用零边路径），各边经过的电缆数
+不得超过其容量。目标为 1) 各路径长度之和（总长度）最小；2) 同值时按
+设备编号排序、依次比较各路径节点序列取字典序最小者。设备数、节点数与
+边数都很小：先对每台设备 DFS 枚举全部简单路径（邻接点按编号升序展开、
+到达终点即先记录，路径按节点序列字典序依次产生），再按设备编号做组合
+DFS，每条路径候选按字典序展开，首个达到更优总长度的完整方案即字典序
+最小者；配合「当前长度 + 剩余设备各自最短路径长度」的总长度乐观下界
+剪枝（等长只会落在字典序更靠后的方案上，剪枝安全）与失败状态记忆化。
 """
 
 from __future__ import annotations
@@ -1678,4 +1689,254 @@ def solve_cable_cutting(
         reel_plans=tuple(reel_plans),
         reel_count=len(reel_plans),
         reel_total_length=sum(reel_lengths[j] for j in cuts_by_reel),
+    )
+
+# ---------------------------------------------------------------------------
+# 电缆路由预演
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CableRouteEdge:
+    """一条无向边（端点按编号小大规范化）。"""
+
+    u: int  # 较小端节点编号
+    v: int  # 较大端节点编号
+    length: int  # 边长度（正整数）
+    capacity: int  # 可同时容纳的电缆数（0~4）
+
+
+@dataclass(frozen=True)
+class CableRouteDevice:
+    """电缆路由预演中的一台设备（相位沿用原计算记录）。"""
+
+    code: str  # 设备唯一编号
+    phase: str  # 所属相（A/B/C），决定该设备的路径起点
+    endpoint: int  # 设备终点节点编号
+
+
+@dataclass(frozen=True)
+class CableRoutePath:
+    """一台设备的电缆路径。"""
+
+    code: str  # 设备编号
+    phase: str  # 所属相（A/B/C）
+    endpoint: int  # 设备终点节点编号
+    nodes: tuple[int, ...]  # 路径经过的节点序列（无重复节点；同点时为单节点）
+    length: int  # 路径总长度（同点零边路径为 0）
+
+
+@dataclass(frozen=True)
+class CableRouteEdgeUsage:
+    """一条边上的电缆占用情况。"""
+
+    u: int  # 较小端节点编号
+    v: int  # 较大端节点编号
+    length: int  # 边长度
+    capacity: int  # 边容量
+    occupied: int  # 经该边铺设的电缆数（不超过容量）
+
+
+@dataclass(frozen=True)
+class CableRoutesResult:
+    """电缆路由预演结果。feasible 为 False 时其余字段为 None。"""
+
+    feasible: bool
+    paths: Optional[tuple[CableRoutePath, ...]]  # 各设备路径（按设备编号排序）
+    total_length: Optional[int]  # 各路径长度之和
+    edge_usage: Optional[tuple[CableRouteEdgeUsage, ...]]  # 各边占用（按端点编号排序）
+
+
+def solve_cable_routes(
+    devices: Iterable[CableRouteDevice],
+    edges: Iterable[CableRouteEdge],
+    phase_starts: dict[str, int],
+    node_count: int,
+) -> CableRoutesResult:
+    """求解电缆路由预演。
+
+    在 node_count 个节点、若干无向边（正整数长度、容量 0~4）构成的图上，
+    每台设备从其所属相起点走一条无重复节点的简单路径至自身终点，起终点
+    相同时使用零边路径；每条边经过的电缆数不得超过其容量。目标依次为：
+    1) 各路径长度之和（总长度）最小；2) 总长度相同时，按设备编号排序，
+    依次比较各路径节点序列取字典序最小者。
+
+    设备、节点、边的规模都很小（至多 4 / 6 / 8），直接精确枚举：
+    - 对每台设备 DFS 枚举全部简单路径：邻接点按编号升序展开、到达终点即
+      记录且不再延伸（终点不可能在路径中重复出现），故候选路径按节点
+      序列字典序依次产生；容量为 0 的边不参与枚举（任何路径都不得经过）。
+    - 再按设备编号做组合 DFS，每台设备的路径候选按字典序展开，首个取得
+      更小总长度的完整方案即字典序最小者；以「当前长度 + 剩余设备各自
+      最短路径长度」为总长度乐观下界做剪枝（等长只会落在字典序更靠后的
+      方案上，下界达到当前最优即可安全剪枝），并记忆失败状态。
+
+    :param devices: 设备集合（编号唯一、相位为 A/B/C、终点为合法节点）。
+    :param edges: 无向边集合（无自环、无重复，长度为正整数，容量 0~4）。
+    :param phase_starts: 各相起点，形如 {"A": int, "B": int, "C": int}。
+    :param node_count: 节点数（节点编号 0 ~ node_count-1）。
+    :return: CableRoutesResult；无可行路由方案时 feasible=False。
+    """
+    ordered = sorted(devices, key=lambda d: d.code)
+    k = len(ordered)
+    # 边按 (u, v) 规范化并排序，边占用与结果顺序均以此为准
+    canon_edges = sorted(
+        (
+            CableRouteEdge(
+                u=min(e.u, e.v),
+                v=max(e.u, e.v),
+                length=e.length,
+                capacity=e.capacity,
+            )
+            for e in edges
+        ),
+        key=lambda e: (e.u, e.v),
+    )
+    m = len(canon_edges)
+
+    # 邻接表：node -> [(相邻节点, 边长度, 边编号)]，按相邻节点编号升序，
+    # 保证简单路径 DFS 按节点序列字典序依次产生候选；容量为 0 的边不可能
+    # 承载任何电缆，不参与路径枚举（经过它的路径必然违反容量约束）。
+    adjacency: dict[int, list[tuple[int, int, int]]] = {
+        node: [] for node in range(node_count)
+    }
+    for idx, edge in enumerate(canon_edges):
+        if edge.capacity <= 0:
+            continue
+        adjacency[edge.u].append((edge.v, edge.length, idx))
+        adjacency[edge.v].append((edge.u, edge.length, idx))
+    for node in adjacency:
+        adjacency[node].sort(key=lambda item: item[0])
+
+    @dataclass(frozen=True)
+    class _Option:
+        """一条候选路径：节点序列、总长度、依次经过的边编号。"""
+
+        nodes: tuple[int, ...]
+        length: int
+        edge_ids: tuple[int, ...]
+
+    def enumerate_paths(start: int, target: int) -> list[_Option]:
+        """枚举 start -> target 的全部简单路径（按节点序列字典序）。"""
+        options: list[_Option] = []
+        visited = [False] * node_count
+        path_nodes: list[int] = [start]
+        path_edges: list[int] = []
+        visited[start] = True
+
+        def dfs(node: int, length: int) -> None:
+            if node == target:
+                # 到达终点即记录；零边路径（start==target）首先记录，
+                # 且终点不可能在无重复节点路径中再次出现，无需继续延伸
+                options.append(
+                    _Option(tuple(path_nodes), length, tuple(path_edges))
+                )
+                return
+            for neighbor, edge_length, edge_id in adjacency[node]:
+                if visited[neighbor]:
+                    continue
+                visited[neighbor] = True
+                path_nodes.append(neighbor)
+                path_edges.append(edge_id)
+                dfs(neighbor, length + edge_length)
+                path_edges.pop()
+                path_nodes.pop()
+                visited[neighbor] = False
+
+        dfs(start, 0)
+        return options
+
+    # 每台设备的候选路径（按节点序列字典序）与最短路径长度
+    options_per_device: list[list[_Option]] = []
+    shortest: list[int] = []
+    for device in ordered:
+        start = phase_starts[device.phase]
+        options = enumerate_paths(start, device.endpoint)
+        if not options:
+            return CableRoutesResult(
+                feasible=False, paths=None, total_length=None, edge_usage=None
+            )
+        options_per_device.append(options)
+        shortest.append(min(option.length for option in options))
+
+    # suffix_shortest[i]：第 i..k-1 台设备各自最短路径长度之和（乐观下界）
+    suffix_shortest = [0] * (k + 1)
+    for i in range(k - 1, -1, -1):
+        suffix_shortest[i] = suffix_shortest[i + 1] + shortest[i]
+
+    used = [0] * m  # 各边当前经过的电缆数
+    chosen: list[Optional[_Option]] = [None] * k
+    best_total: Optional[int] = None
+    best_options: Optional[list[_Option]] = None
+    # 失败状态记忆：(设备序号, 各边占用, 当前总长度) 无法扩展为不劣于最优的完整方案
+    dead: set[tuple[int, tuple[int, ...], int]] = set()
+
+    def dfs(i: int, current_total: int) -> None:
+        nonlocal best_total, best_options
+        if i == k:
+            # 候选按字典序展开，仅总长度严格更优才更新：
+            # 同总长度时先枚举到的完整方案节点序列字典序更小
+            if best_total is None or current_total < best_total:
+                best_total = current_total
+                best_options = [option for option in chosen if option is not None]
+            return
+        # 乐观下界剪枝：后续设备即使各取最短路径，总长度仍不低于当前最优时，
+        # 子树只可能给出等长（字典序更靠后）或更长方案，可整体剪除
+        lower_bound = current_total + suffix_shortest[i]
+        key = (i, tuple(used), current_total)
+        if best_total is not None and lower_bound >= best_total:
+            return
+        if key in dead:
+            return
+        for option in options_per_device[i]:
+            if all(
+                used[edge_id] < canon_edges[edge_id].capacity
+                for edge_id in option.edge_ids
+            ):
+                for edge_id in option.edge_ids:
+                    used[edge_id] += 1
+                chosen[i] = option
+                dfs(i + 1, current_total + option.length)
+                chosen[i] = None
+                for edge_id in option.edge_ids:
+                    used[edge_id] -= 1
+                if best_total is not None and suffix_shortest[0] == best_total:
+                    return  # 已命中全局长度下界，字典序最优方案必已取得
+        dead.add(key)
+
+    dfs(0, 0)
+
+    if best_options is None:
+        return CableRoutesResult(
+            feasible=False, paths=None, total_length=None, edge_usage=None
+        )
+
+    occupied = [0] * m
+    paths: list[CableRoutePath] = []
+    for device, option in zip(ordered, best_options):
+        paths.append(
+            CableRoutePath(
+                code=device.code,
+                phase=device.phase,
+                endpoint=device.endpoint,
+                nodes=option.nodes,
+                length=option.length,
+            )
+        )
+        for edge_id in option.edge_ids:
+            occupied[edge_id] += 1
+    edge_usage = tuple(
+        CableRouteEdgeUsage(
+            u=edge.u,
+            v=edge.v,
+            length=edge.length,
+            capacity=edge.capacity,
+            occupied=occupied[idx],
+        )
+        for idx, edge in enumerate(canon_edges)
+    )
+    return CableRoutesResult(
+        feasible=True,
+        paths=tuple(paths),
+        total_length=sum(option.length for option in best_options),
+        edge_usage=edge_usage,
     )
