@@ -19,6 +19,10 @@ from .schemas import (
     CableCuttingRequest,
     CableCuttingResultResponse,
     CableReelPlanItem,
+    CableRouteEdgeUsageItem,
+    CableRouteItem,
+    CableRoutesRequest,
+    CableRoutesResultResponse,
     DeviceAdditionPlanResult,
     DeviceAdditionRequest,
     FaultDisconnectedItem,
@@ -43,6 +47,8 @@ from .schemas import (
 from .solver import (
     AdditionExistingDevice,
     CableReel,
+    CableRouteDevice,
+    CableRouteEdge,
     CableSegment,
     Device,
     FaultRehearsalDevice,
@@ -53,6 +59,7 @@ from .solver import (
     StartupDevice,
     solve,
     solve_cable_cutting,
+    solve_cable_routes,
     solve_capacity_upgrade,
     solve_device_addition,
     solve_phase_fault_rehearsal,
@@ -111,6 +118,14 @@ _MESSAGE_CABLE_FEASIBLE = (
 _MESSAGE_CABLE_INFEASIBLE = (
     "无可裁方案：不存在每段电缆整体裁出、不拼接且各盘占用不超过盘长的方案"
 )
+_MESSAGE_ROUTES_FEASIBLE = (
+    "预演成功：已在联合总长度最小、并按设备编号排序的路径节点序列字典序最小的"
+    "目标下，找到各设备自所属相起点至终点且各边电缆数不超容量的电缆路由方案"
+)
+_MESSAGE_ROUTES_INFEASIBLE = (
+    "无可行路由：不存在每台设备均自所属相起点经无重复节点路径到达对应终点、"
+    "且每条边经过的电缆数不超过容量的方案"
+)
 
 
 @asynccontextmanager
@@ -157,6 +172,13 @@ app = FastAPI(
         "启用盘总长度，再取按设备编号排序的电缆盘编号序列字典序最小的方案，"
         "返回各盘裁切清单与剩余长度，无可行裁切方案时明确返回"
         "（仅预演，不修改历史记录）。"
+        "对设备不超过 4 台且已有可行分配的计算记录，还可做电缆路由预演："
+        "给定 1~6 个节点（编号 0 至 n-1）、至多 8 条无向边（长度为正整数、"
+        "可容纳电缆数 0~4，无自环、无重复）、各相起点与每台设备的终点，"
+        "每台设备自所属相起点沿无重复节点路径敷设一根电缆至终点"
+        "（起点即终点时为零边路径），每条边经过的电缆数不超容量；"
+        "联合最小化总长度，同值时取按设备编号排序的路径节点序列字典序"
+        "最小者，返回各设备路径、总长度与各边占用（仅预演，不修改历史记录）。"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -896,4 +918,107 @@ def cable_cutting_plan(
         reel_sequence=reel_sequence,
         reel_plans=reel_plans,
         message=_MESSAGE_CABLE_FEASIBLE,
+    )
+
+
+@app.post(
+    "/api/v1/calculations/{calculation_id}/cable-routes",
+    response_model=CableRoutesResultResponse,
+    tags=["calculations"],
+)
+def cable_routes(
+    calculation_id: int, payload: CableRoutesRequest
+) -> CableRoutesResultResponse:
+    """电缆路由预演：为设备不超过 4 台且已有可行分配的记录预演电缆敷设路由。
+
+    沿用记录中每台设备的固定接入相位。请求给出 1~6 个节点（编号 0 至
+    node_count-1）、至多 8 条无向边（长度为正整数、可容纳电缆数 0~4，
+    无自环、无重复）、各相起点节点与每台设备的终点节点（设备编号须与记录
+    完全一致）。每台设备对应一根电缆，须从所属相起点沿一条无重复节点的
+    路径到达终点（起点即终点时为零边路径）；每条边经过的电缆数不得超过
+    其容量。在所有可行方案中联合最小化总长度（各设备路径长度之和），
+    同值时按设备编号排序、比较各路径节点序列取字典序最小者。返回各设备
+    路径、总长度与各边占用；无可行方案时返回 ``feasible=false``、空路径
+    与 null 总长度。仅做预演，不修改历史计算记录。
+
+    记录不存在返回 404；原记录无可行分配返回 409；记录设备超过 4 台、
+    终点映射与记录不一致或字段不满足规则返回 422。
+    """
+    record = db.get_calculation(calculation_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"计算记录不存在：id={calculation_id}",
+        )
+    if not record["feasible"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"计算记录无可行分配，无法进行电缆路由预演：id={calculation_id}",
+        )
+    record_ids = {d["device_id"] for d in record["devices"]}
+    if len(record_ids) > 4:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"计算记录设备数为 {len(record_ids)} 台，超过 4 台，"
+                "无法进行电缆路由预演"
+            ),
+        )
+    terminal_map = {t.device_id: t.node for t in payload.terminals}
+    if set(terminal_map) != record_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="终点映射的设备编号须与计算记录完全一致（不多不少）",
+        )
+
+    devices = [
+        CableRouteDevice(code=d["device_id"], phase=d["assigned_phase"])
+        for d in record["devices"]
+    ]
+    edges = [
+        CableRouteEdge(u=e.u, v=e.v, length=e.length, capacity=e.capacity)
+        for e in payload.edges
+    ]
+    phase_starts = {
+        "A": payload.phase_starts.A,
+        "B": payload.phase_starts.B,
+        "C": payload.phase_starts.C,
+    }
+    result = solve_cable_routes(
+        devices, payload.node_count, edges, phase_starts, terminal_map
+    )
+
+    routes = (
+        [
+            CableRouteItem(
+                device_id=route.code,
+                phase=route.phase,
+                path=list(route.nodes),
+                length=route.length,
+            )
+            for route in result.routes
+        ]
+        if result.feasible
+        else []
+    )
+    edge_usages = [
+        CableRouteEdgeUsageItem(
+            u=edge.u,
+            v=edge.v,
+            length=edge.length,
+            capacity=edge.capacity,
+            used=result.edge_used[idx],
+        )
+        for idx, edge in enumerate(payload.edges)
+    ]
+    return CableRoutesResultResponse(
+        id=record["id"],
+        created_at=record["created_at"],
+        feasible=result.feasible,
+        total_length=result.total_length,
+        routes=routes,
+        edge_usages=edge_usages,
+        message=(
+            _MESSAGE_ROUTES_FEASIBLE if result.feasible else _MESSAGE_ROUTES_INFEASIBLE
+        ),
     )

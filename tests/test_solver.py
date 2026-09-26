@@ -8,6 +8,8 @@ from app.solver import (
     SLOTS,
     AdditionExistingDevice,
     CableReel,
+    CableRouteDevice,
+    CableRouteEdge,
     CableSegment,
     Device,
     FaultRehearsalDevice,
@@ -18,6 +20,7 @@ from app.solver import (
     StartupDevice,
     solve,
     solve_cable_cutting,
+    solve_cable_routes,
     solve_capacity_upgrade,
     solve_device_addition,
     solve_phase_fault_rehearsal,
@@ -2221,6 +2224,412 @@ class CableCuttingFuzzTest(unittest.TestCase):
         self.assertTrue(
             all(v == "R00" for v in result.assignment.values())
         )
+
+
+# ---------------------------------------------------------------------------
+# 电缆路由预演
+# ---------------------------------------------------------------------------
+
+
+def brute_force_routes(devices, node_count, edges, phase_starts, terminals):
+    """朴素全枚举参照实现：枚举各设备简单路径的联合组合。
+
+    返回 (总长度, 按设备编号排序的路径节点序列) 或 None（无解）。
+    目标键为 (总长度, 各设备路径节点序列)，比较均为标准字典序。
+    """
+    ordered = sorted(devices, key=lambda d: d.code)
+    adj = [[] for _ in range(node_count)]
+    for idx, edge in enumerate(edges):
+        adj[edge.u].append((edge.v, idx))
+        adj[edge.v].append((edge.u, idx))
+
+    def simple_paths(start, target):
+        found = []
+
+        def dfs(u, visited, nodes, edge_idxs, total):
+            if u == target:
+                found.append((tuple(nodes), tuple(edge_idxs), total))
+                return
+            for w, ei in adj[u]:
+                if w in visited:
+                    continue
+                visited.add(w)
+                nodes.append(w)
+                edge_idxs.append(ei)
+                dfs(w, visited, nodes, edge_idxs, total + edges[ei].length)
+                nodes.pop()
+                edge_idxs.pop()
+                visited.discard(w)
+
+        dfs(start, {start}, [start], [], 0)
+        return found
+
+    per_device = []
+    for device in ordered:
+        paths = simple_paths(
+            phase_starts[device.phase], terminals[device.code]
+        )
+        if not paths:
+            return None
+        per_device.append(paths)
+
+    best = None
+    for combo in itertools.product(*per_device):
+        usage = [0] * len(edges)
+        ok = True
+        for _, edge_idxs, _ in combo:
+            for ei in edge_idxs:
+                usage[ei] += 1
+                if usage[ei] > edges[ei].capacity:
+                    ok = False
+                    break
+            if not ok:
+                break
+        if not ok:
+            continue
+        key = (
+            sum(path[2] for path in combo),
+            tuple(path[0] for path in combo),
+        )
+        if best is None or key < best:
+            best = key
+    return best
+
+
+def _route_consistency(test_case, result, devices, node_count, edges,
+                       phase_starts, terminals):
+    """对可行结果做自洽校验：路径形态、起止、容量、占用与总长度。"""
+    ordered = sorted(devices, key=lambda d: d.code)
+    edge_index = {}
+    for idx, edge in enumerate(edges):
+        edge_index[(min(edge.u, edge.v), max(edge.u, edge.v))] = idx
+    usage = [0] * len(edges)
+    for route in result.routes:
+        test_case.assertIn(route.code, terminals)
+        test_case.assertEqual(
+            route.nodes[0], phase_starts[route.phase]
+        )
+        test_case.assertEqual(route.nodes[-1], terminals[route.code])
+        # 无重复节点
+        test_case.assertEqual(len(set(route.nodes)), len(route.nodes))
+        # 节点编号有效
+        test_case.assertTrue(all(0 <= x < node_count for x in route.nodes))
+        path_len = 0
+        for a, b in zip(route.nodes, route.nodes[1:]):
+            key = (min(a, b), max(a, b))
+            test_case.assertIn(key, edge_index)
+            ei = edge_index[key]
+            usage[ei] += 1
+            path_len += edges[ei].length
+        test_case.assertEqual(route.length, path_len)
+    test_case.assertEqual(tuple(usage), result.edge_used)
+    for idx, edge in enumerate(edges):
+        test_case.assertLessEqual(result.edge_used[idx], edge.capacity)
+    test_case.assertEqual(
+        result.total_length,
+        sum(edge.length * used for edge, used in zip(edges, result.edge_used)),
+    )
+    test_case.assertEqual(
+        [r.code for r in result.routes], [d.code for d in ordered]
+    )
+
+
+class CableRoutesTest(unittest.TestCase):
+    # 三节点三角形：0-1(4)、1-2(3) 容量 2，直达 0-2(6) 容量 1
+    EDGES = (
+        CableRouteEdge(0, 1, 4, 2),
+        CableRouteEdge(1, 2, 3, 1),
+        CableRouteEdge(0, 2, 6, 1),
+    )
+    PHASE_STARTS = {"A": 0, "B": 0, "C": 2}
+
+    def test_lex_tie_break_prefers_smaller_node_sequence(self):
+        # 两台设备均自节点 0 到节点 2：直达边 0-2 容量 1，必有一台绕行 0-1-2。
+        # 两种分配总长度同为 13；按设备编号排序比较路径节点序列，
+        # ([0,1,2],[0,2]) 字典序小于 ([0,2],[0,1,2])（第二位 1 < 2）。
+        devices = [CableRouteDevice("D1", "A"), CableRouteDevice("D2", "A")]
+        result = solve_cable_routes(
+            devices, 3, self.EDGES, self.PHASE_STARTS, {"D1": 2, "D2": 2}
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.total_length, 13)
+        self.assertEqual(
+            [(r.code, r.phase, r.nodes, r.length) for r in result.routes],
+            [
+                ("D1", "A", (0, 1, 2), 7),
+                ("D2", "A", (0, 2), 6),
+            ],
+        )
+        self.assertEqual(result.edge_used, (1, 1, 1))
+        _route_consistency(
+            self, result, devices, 3, self.EDGES, self.PHASE_STARTS,
+            {"D1": 2, "D2": 2},
+        )
+
+    def test_min_total_length_beats_lexicographic_order(self):
+        # 直达边容量放宽为 2：两台均可走 [0,2]，总长度 12 严格小于 13，
+        # 不因 [0,1,2] 在字典序中更小而选择绕行
+        edges = (
+            CableRouteEdge(0, 1, 4, 2),
+            CableRouteEdge(1, 2, 3, 1),
+            CableRouteEdge(0, 2, 6, 2),
+        )
+        devices = [CableRouteDevice("D1", "A"), CableRouteDevice("D2", "A")]
+        result = solve_cable_routes(
+            devices, 3, edges, self.PHASE_STARTS, {"D1": 2, "D2": 2}
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.total_length, 12)
+        self.assertEqual([r.nodes for r in result.routes], [(0, 2), (0, 2)])
+        self.assertEqual(result.edge_used, (0, 0, 2))
+
+    def test_zero_edge_path_when_terminal_is_start(self):
+        edges = [CableRouteEdge(0, 1, 5, 1)]
+        devices = [CableRouteDevice("D1", "B")]
+        result = solve_cable_routes(
+            devices, 2, edges, {"A": 0, "B": 1, "C": 0}, {"D1": 1}
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.total_length, 0)
+        self.assertEqual(result.routes[0].nodes, (1,))
+        self.assertEqual(result.routes[0].length, 0)
+        self.assertEqual(result.edge_used, (0,))
+
+    def test_zero_edge_path_coexists_with_routed_device(self):
+        # D1 终点即 B 相起点（零边路径，不占任何边），D2 正常敷设
+        edges = [CableRouteEdge(0, 1, 5, 1)]
+        devices = [
+            CableRouteDevice("D1", "B"),
+            CableRouteDevice("D2", "A"),
+        ]
+        result = solve_cable_routes(
+            devices, 2, edges, {"A": 0, "B": 1, "C": 0},
+            {"D1": 1, "D2": 1},
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.total_length, 5)
+        self.assertEqual(
+            [(r.code, r.nodes) for r in result.routes],
+            [("D1", (1,)), ("D2", (0, 1))],
+        )
+        self.assertEqual(result.edge_used, (1,))
+
+    def test_zero_capacity_edge_unusable(self):
+        # 唯一边容量为 0：不可经过，节点 1 不可达 -> 无解
+        devices = [CableRouteDevice("D1", "A")]
+        edges = [CableRouteEdge(0, 1, 5, 0)]
+        result = solve_cable_routes(
+            devices, 2, edges, {"A": 0, "B": 0, "C": 0}, {"D1": 1}
+        )
+        self.assertFalse(result.feasible)
+        self.assertIsNone(result.routes)
+        self.assertIsNone(result.total_length)
+        self.assertEqual(result.edge_used, (0,))
+
+    def test_disconnected_target_infeasible(self):
+        devices = [CableRouteDevice("D1", "A")]
+        edges = [CableRouteEdge(0, 1, 5, 1)]
+        result = solve_cable_routes(
+            devices, 3, edges, {"A": 0, "B": 0, "C": 0}, {"D1": 2}
+        )
+        self.assertFalse(result.feasible)
+        self.assertIsNone(result.routes)
+
+    def test_capacity_forces_detour(self):
+        # 短路 0-1-2 各边容量 1 只能供一台设备，另一台走长直边 0-2(5)。
+        # 总长度 7 唯一（2+5）；同值时 D1 取字典序更小的 [0,1,2]。
+        edges = (
+            CableRouteEdge(0, 1, 1, 1),
+            CableRouteEdge(1, 2, 1, 1),
+            CableRouteEdge(0, 2, 5, 1),
+        )
+        devices = [CableRouteDevice("D1", "A"), CableRouteDevice("D2", "A")]
+        result = solve_cable_routes(
+            devices, 3, edges, self.PHASE_STARTS, {"D1": 2, "D2": 2}
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.total_length, 7)
+        self.assertEqual(
+            [(r.code, r.nodes) for r in result.routes],
+            [("D1", (0, 1, 2)), ("D2", (0, 2))],
+        )
+        self.assertEqual(result.edge_used, (1, 1, 1))
+
+    def test_phase_specific_starts(self):
+        # D1 接 A（起点 0）至节点 3；D2 接 B（起点 2）至节点 0。
+        # 唯一链路：D1 = [0,1,2,3] 长 6，D2 = [2,1,0] 长 4；
+        # 边 0-1、1-2 各承载 2 根电缆（容量 2 恰好可行），边 2-3 承载 1 根。
+        edges = (
+            CableRouteEdge(0, 1, 2, 2),
+            CableRouteEdge(1, 2, 2, 2),
+            CableRouteEdge(2, 3, 2, 2),
+        )
+        devices = [
+            CableRouteDevice("D1", "A"),
+            CableRouteDevice("D2", "B"),
+        ]
+        starts = {"A": 0, "B": 2, "C": 0}
+        result = solve_cable_routes(
+            devices, 4, edges, starts, {"D1": 3, "D2": 0}
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.total_length, 10)
+        self.assertEqual(
+            [(r.code, r.phase, r.nodes) for r in result.routes],
+            [("D1", "A", (0, 1, 2, 3)), ("D2", "B", (2, 1, 0))],
+        )
+        self.assertEqual(result.edge_used, (2, 2, 1))
+
+    def test_capacity_exceeded_on_shared_edge_infeasible(self):
+        # 三台设备都要从 0 到 1，唯一边容量 2 -> 无解
+        edges = [CableRouteEdge(0, 1, 1, 2)]
+        devices = [CableRouteDevice(f"D{i}", "A") for i in range(1, 4)]
+        result = solve_cable_routes(
+            devices, 2, edges, {"A": 0, "B": 0, "C": 0},
+            {f"D{i}": 1 for i in range(1, 4)},
+        )
+        self.assertFalse(result.feasible)
+        self.assertEqual(result.edge_used, (0,))
+
+    def test_single_node_all_zero_edge(self):
+        devices = [
+            CableRouteDevice("D1", "A"),
+            CableRouteDevice("D2", "C"),
+        ]
+        result = solve_cable_routes(
+            devices, 1, [], {"A": 0, "B": 0, "C": 0},
+            {"D1": 0, "D2": 0},
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.total_length, 0)
+        self.assertEqual([r.nodes for r in result.routes], [(0,), (0,)])
+        self.assertEqual(result.edge_used, ())
+
+    def test_device_ids_sorted_as_strings(self):
+        devices = [
+            CableRouteDevice("D10", "A"),
+            CableRouteDevice("D2", "A"),
+            CableRouteDevice("D3", "A"),
+        ]
+        result = solve_cable_routes(
+            devices, 3, self.EDGES, self.PHASE_STARTS,
+            {"D10": 2, "D2": 2, "D3": 0},
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(
+            [r.code for r in result.routes], ["D10", "D2", "D3"]
+        )
+        # D3 终点即起点：零边路径
+        self.assertEqual(result.routes[2].nodes, (0,))
+
+
+class CableRoutesFuzzTest(unittest.TestCase):
+    """电缆路由求解与朴素全枚举参照实现做随机对拍。"""
+
+    def test_against_brute_force(self):
+        rng = random.Random(20260926)
+        for case in range(500):
+            node_count = rng.randint(1, 6)
+            pairs = [
+                (u, v)
+                for u in range(node_count)
+                for v in range(u + 1, node_count)
+            ]
+            rng.shuffle(pairs)
+            m = rng.randint(0, min(8, len(pairs)))
+            edges = [
+                CableRouteEdge(u, v, rng.randint(1, 9), rng.randint(0, 4))
+                for u, v in pairs[:m]
+            ]
+            phase_starts = {p: rng.randrange(node_count) for p in PHASES}
+            k = rng.randint(1, 4)
+            devices = [
+                CableRouteDevice(f"D{i:02d}", rng.choice(PHASES))
+                for i in range(k)
+            ]
+            terminals = {d.code: rng.randrange(node_count) for d in devices}
+
+            expected = brute_force_routes(
+                devices, node_count, edges, phase_starts, terminals
+            )
+            result = solve_cable_routes(
+                devices, node_count, edges, phase_starts, terminals
+            )
+            if expected is None:
+                self.assertFalse(result.feasible, f"case {case}: 应为无解")
+                self.assertIsNone(result.total_length)
+                self.assertEqual(
+                    result.edge_used, tuple(0 for _ in edges),
+                    f"case {case}: 无解时占用应为 0",
+                )
+                continue
+            self.assertTrue(result.feasible, f"case {case}: 应有解")
+            self.assertEqual(
+                result.total_length, expected[0],
+                f"case {case}: 总长度不符",
+            )
+            actual_seq = tuple(r.nodes for r in result.routes)
+            self.assertEqual(
+                actual_seq, expected[1], f"case {case}: 路径序列不符"
+            )
+            _route_consistency(
+                self, result, devices, node_count, edges,
+                phase_starts, terminals,
+            )
+
+    def test_four_devices_max_scale_performance(self):
+        # 最大规模：4 台设备、6 节点、8 边，含若干紧容量边
+        edges = [
+            CableRouteEdge(0, 1, 3, 1),
+            CableRouteEdge(0, 2, 2, 2),
+            CableRouteEdge(1, 2, 2, 1),
+            CableRouteEdge(1, 3, 4, 1),
+            CableRouteEdge(2, 3, 1, 2),
+            CableRouteEdge(2, 4, 5, 1),
+            CableRouteEdge(3, 5, 2, 1),
+            CableRouteEdge(4, 5, 1, 1),
+        ]
+        phase_starts = {"A": 0, "B": 2, "C": 5}
+        devices = [
+            CableRouteDevice("D1", "A"),
+            CableRouteDevice("D2", "A"),
+            CableRouteDevice("D3", "B"),
+            CableRouteDevice("D4", "C"),
+        ]
+        terminals = {"D1": 5, "D2": 4, "D3": 0, "D4": 2}
+        expected = brute_force_routes(
+            devices, 6, edges, phase_starts, terminals
+        )
+        result = solve_cable_routes(
+            devices, 6, edges, phase_starts, terminals
+        )
+        self.assertEqual(result.feasible, expected is not None)
+        if expected is not None:
+            self.assertEqual(result.total_length, expected[0])
+            self.assertEqual(
+                tuple(r.nodes for r in result.routes), expected[1]
+            )
+            _route_consistency(
+                self, result, devices, 6, edges, phase_starts, terminals
+            )
+
+    def test_four_devices_complete_graph_few_edges(self):
+        # 4 台设备同相、同起点同终点，仅两条边容量各 4：全部可同走最短链
+        edges = [
+            CableRouteEdge(0, 1, 2, 4),
+            CableRouteEdge(0, 1 + 1, 5, 4) if False else CableRouteEdge(1, 2, 3, 4),
+        ]
+        devices = [CableRouteDevice(f"D{i}", "A") for i in range(1, 5)]
+        result = solve_cable_routes(
+            devices, 3, edges, {"A": 0, "B": 0, "C": 0},
+            {f"D{i}": 2 for i in range(1, 5)},
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.total_length, 20)
+        self.assertTrue(
+            all(r.nodes == (0, 1, 2) for r in result.routes)
+        )
+        self.assertEqual(result.edge_used, (4, 4))
 
 
 if __name__ == "__main__":
